@@ -1,21 +1,18 @@
 """
-QUANT SCREENER - FastAPI Backend
-실시간 yfinance 데이터 + 모멘텀/펀더멘털/섹터 점수 계산
+QUANT SCREENER - FastAPI Backend (Finnhub Edition)
 """
 
 from fastapi import FastAPI, Query
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import JSONResponse
-import yfinance as yf
-import pandas as pd
-import numpy as np
-from datetime import datetime
+import httpx
+import os
 import asyncio
-from concurrent.futures import ThreadPoolExecutor
-from typing import Optional
+from datetime import datetime
 import time
+import numpy as np
 
-app = FastAPI(title="Quant Screener API", version="1.0.0")
+app = FastAPI(title="Quant Screener API", version="2.0.0")
 
 app.add_middleware(
     CORSMiddleware,
@@ -24,28 +21,15 @@ app.add_middleware(
     allow_headers=["*"],
 )
 
-executor = ThreadPoolExecutor(max_workers=8)
+FINNHUB_KEY = os.getenv("FINNHUB_KEY", "")
+BASE_URL = "https://finnhub.io/api/v1"
 
-# ── 유니버스 ──────────────────────────────────────────────
 US_TICKERS = [
-    "AAPL","MSFT","NVDA","GOOGL","META","AMZN","TSLA","AVGO","AMD","ORCL",
-    "CRM","ADBE","QCOM","TXN","INTC","AMAT","LRCX","MU","NOW","SNPS",
-    "JPM","BAC","GS","MS","WFC","V","MA","PYPL","AXP","BLK",
-    "UNH","LLY","JNJ","ABBV","MRK","PFE","AMGN","GILD","REGN","VRTX",
-    "XOM","CVX","COP","EOG","SLB","OXY","MPC","PSX","VLO","HAL",
-    "CAT","DE","HON","BA","RTX","LMT","GE","ETN","CTSH","ACN",
-    "NEM","FCX","CF","ALB","FSLR","NEE","DUK","COST","WMT","HD",
-    "TROW","SCHW","CB","PLD","AMT","EQIX","VICI","NKE","PG","KO",
-]
-
-KR_TICKERS = [
-    "005930.KS","000660.KS","035420.KS","005380.KS","051910.KS",
-    "006400.KS","035720.KS","068270.KS","207940.KS","005490.KS",
-    "000270.KS","096770.KS","012330.KS","028260.KS","066570.KS",
-    "003550.KS","033780.KS","018260.KS","010130.KS","009150.KS",
-    "086790.KS","015760.KS","011200.KS","034730.KS","047050.KS",
-    "055550.KS","105560.KS","316140.KS","139480.KS","097950.KS",
-    "267250.KS","078930.KS","011070.KS","047810.KS","042700.KS",
+    "AAPL", "MSFT", "NVDA", "GOOGL", "META",
+    "AMZN", "TSLA", "AVGO", "AMD", "ORCL",
+    "JPM", "V", "MA", "UNH", "LLY",
+    "XOM", "CVX", "CAT", "DE", "NEM",
+    "FSLR", "COST", "WMT", "HD", "PG",
 ]
 
 US_SECTOR_ETFS = {
@@ -62,20 +46,10 @@ US_SECTOR_ETFS = {
     "Communication Services": "XLC",
 }
 
-KR_SECTOR_ETFS = {
-    "반도체": "091160.KS",
-    "2차전지": "305720.KS",
-    "바이오": "244580.KS",
-    "자동차": "091180.KS",
-    "IT": "266360.KS",
-    "금융": "139270.KS",
-}
+BENCHMARK = "SPY"
+CACHE_TTL = 1800
 
-BENCHMARK = {"US": "SPY", "KR": "069500.KS"}
-
-# ── 캐시 ──────────────────────────────────────────────────
 _cache: dict = {}
-CACHE_TTL = 600
 
 
 def cache_get(key):
@@ -90,140 +64,206 @@ def cache_set(key, data):
     _cache[key] = (data, time.time())
 
 
-# ── 점수 계산 ─────────────────────────────────────────────
-def calc_momentum_score(hist: pd.DataFrame, bm_hist: pd.DataFrame) -> float:
+async def fh_get(client, endpoint, params):
+    params["token"] = FINNHUB_KEY
     try:
-        close = hist["Close"].dropna()
-        bm_close = bm_hist["Close"].dropna()
-        if len(close) < 20:
-            return 0.0
-        now = float(close.iloc[-1])
-        m1 = (now / float(close.iloc[-21]) - 1) * 100 if len(close) >= 21 else 0.0
-        m3 = (now / float(close.iloc[-63]) - 1) * 100 if len(close) >= 63 else 0.0
-        m6 = (now / float(close.iloc[-126]) - 1) * 100 if len(close) >= 126 else 0.0
-        rs = 0.0
-        if len(bm_close) >= 21 and len(close) >= 21:
-            bm_ret = (float(bm_close.iloc[-1]) / float(bm_close.iloc[-21]) - 1) * 100
-            rs = m1 - bm_ret
-        raw = m1 * 0.5 + m3 * 0.3 + m6 * 0.1 + rs * 0.1
-        return float(np.clip(50 + raw * 1.5, 0, 100))
+        r = await client.get(f"{BASE_URL}{endpoint}", params=params, timeout=10.0)
+        if r.status_code == 200:
+            return r.json()
     except Exception:
-        return 0.0
+        pass
+    return None
 
 
-def calc_fundamental_score(info: dict) -> float:
+async def get_quote(client, symbol):
+    return await fh_get(client, "/quote", {"symbol": symbol})
+
+
+async def get_metrics(client, symbol):
+    return await fh_get(client, "/stock/metric", {"symbol": symbol, "metric": "all"})
+
+
+async def get_candles(client, symbol, days=180):
+    end = int(time.time())
+    start = end - (days * 86400)
+    return await fh_get(client, "/stock/candle", {
+        "symbol": symbol, "resolution": "D", "from": start, "to": end
+    })
+
+
+async def get_profile(client, symbol):
+    return await fh_get(client, "/stock/profile2", {"symbol": symbol})
+
+
+def calc_momentum_score(candles, bm_candles):
     try:
+        if not candles or "c" not in candles or not candles["c"]:
+            return 50.0
+        c = candles["c"]
+        if len(c) < 22:
+            return 50.0
+
+        now = c[-1]
+        m1 = (now / c[-21] - 1) * 100 if len(c) >= 21 else 0
+        m3 = (now / c[-63] - 1) * 100 if len(c) >= 63 else 0
+
+        rs = 0.0
+        if bm_candles and "c" in bm_candles and len(bm_candles["c"]) >= 21:
+            bm = bm_candles["c"]
+            bm_ret = (bm[-1] / bm[-21] - 1) * 100
+            rs = m1 - bm_ret
+
+        raw = m1 * 0.5 + m3 * 0.3 + rs * 0.2
+        return float(np.clip(50 + raw * 1.8, 0, 100))
+    except Exception:
+        return 50.0
+
+
+def calc_fundamental_score(metrics):
+    try:
+        if not metrics or "metric" not in metrics:
+            return 50.0
+        m = metrics["metric"]
         score = 50.0
-        pe = info.get("trailingPE") or info.get("forwardPE")
-        if pe and 0 < float(pe) < 200:
-            score += (float(np.clip(100 - abs(float(pe) - 20) * 2, 0, 100)) - 50) * 0.25
-        roe = info.get("returnOnEquity")
+
+        pe = m.get("peNormalizedAnnual") or m.get("peTTM")
+        if pe and 0 < pe < 200:
+            pe_score = 100 - abs(pe - 20) * 2
+            score += (float(np.clip(pe_score, 0, 100)) - 50) * 0.3
+
+        roe = m.get("roeTTM") or m.get("roeRfy")
         if roe:
-            score += (min(float(roe) * 500, 100) - 50) * 0.25
-        fcf = info.get("freeCashflow")
-        mktcap = info.get("marketCap")
-        if fcf and mktcap and float(mktcap) > 0:
-            score += (min((float(fcf) / float(mktcap)) * 1000, 100) - 50) * 0.2
-        growth = info.get("earningsGrowth") or info.get("revenueGrowth")
-        if growth:
-            score += (min(float(growth) * 300, 100) - 50) * 0.15
-        pb = info.get("priceToBook")
-        if pb and 0 < float(pb) < 50:
-            score += (float(np.clip(100 - abs(float(pb) - 3) * 5, 0, 100)) - 50) * 0.15
+            roe_score = min(roe * 5, 100)
+            score += (roe_score - 50) * 0.3
+
+        eps_growth = m.get("epsGrowth5Y") or m.get("epsGrowthTTMYoy")
+        if eps_growth:
+            eg_score = min(eps_growth * 3, 100)
+            score += (eg_score - 50) * 0.2
+
+        pb = m.get("pbAnnual") or m.get("pbQuarterly")
+        if pb and 0 < pb < 50:
+            pb_score = 100 - abs(pb - 3) * 5
+            score += (float(np.clip(pb_score, 0, 100)) - 50) * 0.2
+
         return float(np.clip(score, 0, 100))
     except Exception:
         return 50.0
 
 
-def calc_sector_score(sector: str, sector_scores: dict) -> float:
-    for k, v in sector_scores.items():
-        if k.lower() in (sector or "").lower():
-            return float(v)
-    return 50.0
+async def analyze_stock(client, symbol, bm_candles, sector_scores):
+    candles = await get_candles(client, symbol)
+    metrics = await get_metrics(client, symbol)
+    profile = await get_profile(client, symbol)
 
-
-def fetch_one_stock(ticker: str, bm_hist: pd.DataFrame, sector_scores: dict) -> Optional[dict]:
-    try:
-        stk = yf.Ticker(ticker)
-        hist = stk.history(period="1y")
-        if hist.empty or len(hist) < 20:
-            return None
-        info = stk.info or {}
-        company = info.get("longName") or info.get("shortName") or ticker
-        sector = info.get("sector") or info.get("industry") or "Other"
-        pe = info.get("trailingPE") or info.get("forwardPE")
-        roe = info.get("returnOnEquity")
-        close = hist["Close"].dropna()
-        change_1m = 0.0
-        if len(close) >= 21:
-            change_1m = (float(close.iloc[-1]) / float(close.iloc[-21]) - 1) * 100
-        return {
-            "ticker": ticker.replace(".KS", "").replace(".KQ", ""),
-            "company": str(company)[:30],
-            "sector": str(sector),
-            "pe": round(float(pe), 1) if pe else None,
-            "roe": f"{float(roe)*100:.1f}%" if roe else "–",
-            "change1m": f"{change_1m:+.1f}%",
-            "momentum_raw": calc_momentum_score(hist, bm_hist),
-            "fundamental_raw": calc_fundamental_score(info),
-            "sector_raw": calc_sector_score(sector, sector_scores),
-        }
-    except Exception:
+    if not candles or "c" not in candles or not candles["c"]:
         return None
 
+    company = symbol
+    sector = "Other"
+    if profile:
+        company = profile.get("name") or symbol
+        sector = profile.get("finnhubIndustry") or "Other"
 
-def fetch_sector_scores(etf_map: dict, benchmark: str) -> dict:
-    try:
-        bm_close = yf.Ticker(benchmark).history(period="3mo")["Close"].dropna()
-        scores = {}
-        for sector, etf in etf_map.items():
-            try:
-                h = yf.Ticker(etf).history(period="3mo")["Close"].dropna()
-                if len(h) < 21 or len(bm_close) < 21:
-                    scores[sector] = 50.0
-                    continue
-                ret = (float(h.iloc[-1]) / float(h.iloc[-21]) - 1) * 100
-                bm_ret = (float(bm_close.iloc[-1]) / float(bm_close.iloc[-21]) - 1) * 100
-                scores[sector] = float(np.clip(50 + (ret - bm_ret) * 3, 0, 100))
-            except Exception:
-                scores[sector] = 50.0
-        return scores
-    except Exception:
-        return {k: 50.0 for k in etf_map}
+    pe = None
+    roe_str = "-"
+    if metrics and "metric" in metrics:
+        m = metrics["metric"]
+        pe_val = m.get("peNormalizedAnnual") or m.get("peTTM")
+        if pe_val and pe_val > 0:
+            pe = round(pe_val, 1)
+        roe_val = m.get("roeTTM") or m.get("roeRfy")
+        if roe_val:
+            roe_str = f"{roe_val:.1f}%"
+
+    change_1m = 0.0
+    c = candles["c"]
+    if len(c) >= 21:
+        change_1m = (c[-1] / c[-21] - 1) * 100
+
+    sect_score = 50.0
+    for k, v in sector_scores.items():
+        if k.lower() in (sector or "").lower() or sector.lower() in k.lower():
+            sect_score = v
+            break
+
+    return {
+        "ticker": symbol,
+        "company": str(company)[:30],
+        "sector": str(sector),
+        "pe": pe,
+        "roe": roe_str,
+        "change1m": f"{change_1m:+.1f}%",
+        "momentum_raw": calc_momentum_score(candles, bm_candles),
+        "fundamental_raw": calc_fundamental_score(metrics),
+        "sector_raw": sect_score,
+    }
 
 
-# ── 엔드포인트 ────────────────────────────────────────────
+async def get_sector_scores(client):
+    bm_candles = await get_candles(client, BENCHMARK, days=90)
+    if not bm_candles or "c" not in bm_candles or len(bm_candles["c"]) < 21:
+        return {k: 50.0 for k in US_SECTOR_ETFS}
+
+    bm_c = bm_candles["c"]
+    bm_ret = (bm_c[-1] / bm_c[-21] - 1) * 100
+
+    scores = {}
+    for name, etf in US_SECTOR_ETFS.items():
+        try:
+            res = await get_candles(client, etf, days=90)
+            if res and "c" in res and len(res["c"]) >= 21:
+                c = res["c"]
+                ret = (c[-1] / c[-21] - 1) * 100
+                rs = ret - bm_ret
+                scores[name] = float(np.clip(50 + rs * 4, 0, 100))
+            else:
+                scores[name] = 50.0
+        except Exception:
+            scores[name] = 50.0
+
+    return scores
+
+
 @app.get("/")
 def root():
-    return {"status": "ok", "version": "1.0.0"}
+    return {
+        "status": "ok",
+        "version": "2.0.0",
+        "data_source": "Finnhub",
+        "key_configured": bool(FINNHUB_KEY),
+    }
 
 
 @app.get("/api/screen")
 async def screen_stocks(
-    market: str = Query("US", regex="^(US|KR)$"),
+    market: str = Query("US"),
     w_momentum: float = Query(60, ge=0, le=100),
     w_fundamental: float = Query(25, ge=0, le=100),
     w_sector: float = Query(15, ge=0, le=100),
     top_n: int = Query(20, ge=5, le=50),
 ):
+    if not FINNHUB_KEY:
+        return JSONResponse(
+            {"error": "FINNHUB_KEY not set"},
+            status_code=500
+        )
+
     cache_key = f"{market}_{w_momentum}_{w_fundamental}_{w_sector}"
     cached = cache_get(cache_key)
     if cached:
         return JSONResponse({**cached, "from_cache": True})
 
-    loop = asyncio.get_event_loop()
-    tickers = US_TICKERS if market == "US" else KR_TICKERS
-    etf_map = US_SECTOR_ETFS if market == "US" else KR_SECTOR_ETFS
-    benchmark = BENCHMARK[market]
+    async with httpx.AsyncClient() as client:
+        sector_scores = await get_sector_scores(client)
+        bm_candles = await get_candles(client, BENCHMARK, days=180)
 
-    sector_scores = await loop.run_in_executor(executor, fetch_sector_scores, etf_map, benchmark)
-    bm_hist = await loop.run_in_executor(executor, lambda: yf.Ticker(benchmark).history(period="1y"))
+        tasks = [
+            analyze_stock(client, t, bm_candles, sector_scores)
+            for t in US_TICKERS
+        ]
+        results = await asyncio.gather(*tasks)
 
-    tasks = [
-        loop.run_in_executor(executor, fetch_one_stock, t, bm_hist, sector_scores)
-        for t in tickers[:40]
-    ]
-    results = await asyncio.gather(*tasks)
     valid = [r for r in results if r is not None]
 
     total_w = max(w_momentum + w_fundamental + w_sector, 1)
@@ -250,38 +290,20 @@ async def screen_stocks(
                 "trend": "강세" if sector_scores.get(name, 50) >= 60
                          else ("중립" if sector_scores.get(name, 50) >= 40 else "약세"),
             }
-            for name, etf in etf_map.items()
+            for name, etf in US_SECTOR_ETFS.items()
         ],
         key=lambda x: x["score"], reverse=True
     )
 
     response = {
-        "market": market,
+        "market": "US",
         "updated": datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
         "from_cache": False,
         "weights": {"momentum": w_momentum, "fundamental": w_fundamental, "sector": w_sector},
         "top20": sorted_stocks,
         "sectors": sector_list,
     }
+
     cache_set(cache_key, response)
     return JSONResponse(response)
 
-
-@app.get("/api/sectors")
-async def get_sectors(market: str = Query("US", regex="^(US|KR)$")):
-    etf_map = US_SECTOR_ETFS if market == "US" else KR_SECTOR_ETFS
-    benchmark = BENCHMARK[market]
-    loop = asyncio.get_event_loop()
-    scores = await loop.run_in_executor(executor, fetch_sector_scores, etf_map, benchmark)
-    return {
-        "market": market,
-        "updated": datetime.now().isoformat(),
-        "sectors": [
-            {
-                "name": k, "etf": v,
-                "score": round(scores.get(k, 50.0), 1),
-                "trend": "강세" if scores.get(k, 50) >= 60 else ("중립" if scores.get(k, 50) >= 40 else "약세"),
-            }
-            for k, v in etf_map.items()
-        ],
-    }
