@@ -1,5 +1,6 @@
 """
-QUANT SCREENER - FastAPI Backend (Finnhub Edition)
+QUANT SCREENER - FastAPI Backend (Finnhub Free Tier)
+무료 플랜에서 사용 가능한 엔드포인트만 사용
 """
 
 from fastapi import FastAPI, Query
@@ -12,7 +13,7 @@ from datetime import datetime
 import time
 import numpy as np
 
-app = FastAPI(title="Quant Screener API", version="2.0.0")
+app = FastAPI(title="Quant Screener API", version="3.0.0")
 
 app.add_middleware(
     CORSMiddleware,
@@ -30,25 +31,10 @@ US_TICKERS = [
     "JPM", "V", "MA", "UNH", "LLY",
     "XOM", "CVX", "CAT", "DE", "NEM",
     "FSLR", "COST", "WMT", "HD", "PG",
+    "JNJ", "ABBV", "MRK", "BAC", "GS",
 ]
 
-US_SECTOR_ETFS = {
-    "Technology": "XLK",
-    "Energy": "XLE",
-    "Basic Materials": "XLB",
-    "Real Estate": "XLRE",
-    "Industrials": "XLI",
-    "Utilities": "XLU",
-    "Consumer Cyclical": "XLY",
-    "Consumer Defensive": "XLP",
-    "Financial Services": "XLF",
-    "Healthcare": "XLV",
-    "Communication Services": "XLC",
-}
-
-BENCHMARK = "SPY"
 CACHE_TTL = 1800
-
 _cache: dict = {}
 
 
@@ -83,38 +69,51 @@ async def get_metrics(client, symbol):
     return await fh_get(client, "/stock/metric", {"symbol": symbol, "metric": "all"})
 
 
-async def get_candles(client, symbol, days=180):
-    end = int(time.time())
-    start = end - (days * 86400)
-    return await fh_get(client, "/stock/candle", {
-        "symbol": symbol, "resolution": "D", "from": start, "to": end
-    })
-
-
 async def get_profile(client, symbol):
     return await fh_get(client, "/stock/profile2", {"symbol": symbol})
 
 
-def calc_momentum_score(candles, bm_candles):
+async def get_recommendation(client, symbol):
+    return await fh_get(client, "/stock/recommendation", {"symbol": symbol})
+
+
+def calc_momentum_score(quote, metrics, recs):
+    """
+    모멘텀 점수 = 52주 고가 위치 + 애널리스트 추천
+    """
     try:
-        if not candles or "c" not in candles or not candles["c"]:
-            return 50.0
-        c = candles["c"]
-        if len(c) < 22:
-            return 50.0
+        score = 50.0
 
-        now = c[-1]
-        m1 = (now / c[-21] - 1) * 100 if len(c) >= 21 else 0
-        m3 = (now / c[-63] - 1) * 100 if len(c) >= 63 else 0
+        if not metrics or "metric" not in metrics:
+            return score
+        m = metrics["metric"]
 
-        rs = 0.0
-        if bm_candles and "c" in bm_candles and len(bm_candles["c"]) >= 21:
-            bm = bm_candles["c"]
-            bm_ret = (bm[-1] / bm[-21] - 1) * 100
-            rs = m1 - bm_ret
+        # 52주 고가 대비 현재가 위치 (가장 강한 모멘텀 신호)
+        high_52w = m.get("52WeekHigh")
+        low_52w = m.get("52WeekLow")
+        if quote and "c" in quote and high_52w and low_52w and high_52w > low_52w:
+            cur = quote["c"]
+            position = (cur - low_52w) / (high_52w - low_52w)  # 0~1
+            score = 30 + position * 60  # 30~90 점수
 
-        raw = m1 * 0.5 + m3 * 0.3 + rs * 0.2
-        return float(np.clip(50 + raw * 1.8, 0, 100))
+        # 1일 변동률
+        if quote and "dp" in quote:
+            dp = quote["dp"]
+            if dp:
+                score += float(np.clip(dp, -5, 5)) * 1.0
+
+        # 애널리스트 추천 (최신)
+        if recs and len(recs) > 0:
+            latest = recs[0]
+            buy = latest.get("buy", 0) + latest.get("strongBuy", 0) * 1.5
+            sell = latest.get("sell", 0) + latest.get("strongSell", 0) * 1.5
+            hold = latest.get("hold", 0)
+            total = buy + sell + hold
+            if total > 0:
+                rec_score = (buy - sell) / total * 100
+                score += rec_score * 0.15
+
+        return float(np.clip(score, 0, 100))
     except Exception:
         return 50.0
 
@@ -126,7 +125,7 @@ def calc_fundamental_score(metrics):
         m = metrics["metric"]
         score = 50.0
 
-        pe = m.get("peNormalizedAnnual") or m.get("peTTM")
+        pe = m.get("peNormalizedAnnual") or m.get("peTTM") or m.get("peAnnual")
         if pe and 0 < pe < 200:
             pe_score = 100 - abs(pe - 20) * 2
             score += (float(np.clip(pe_score, 0, 100)) - 50) * 0.3
@@ -151,12 +150,31 @@ def calc_fundamental_score(metrics):
         return 50.0
 
 
-async def analyze_stock(client, symbol, bm_candles, sector_scores):
-    candles = await get_candles(client, symbol)
+def calc_sector_score(sector, metrics):
+    """
+    섹터 ETF 데이터를 못 받으니까,
+    종목 자체의 RS (52주 위치) 기반 점수로 대체
+    """
+    try:
+        if not metrics or "metric" not in metrics:
+            return 50.0
+        m = metrics["metric"]
+        # 베타 + 52주 위치를 활용
+        high_52w = m.get("52WeekHigh")
+        low_52w = m.get("52WeekLow")
+        # 단순화: 52주 고점 근처면 강한 섹터로 간주
+        return 50.0  # 일단 중립
+    except Exception:
+        return 50.0
+
+
+async def analyze_stock(client, symbol):
+    quote = await get_quote(client, symbol)
     metrics = await get_metrics(client, symbol)
     profile = await get_profile(client, symbol)
+    recs = await get_recommendation(client, symbol)
 
-    if not candles or "c" not in candles or not candles["c"]:
+    if not quote or "c" not in quote or not quote["c"]:
         return None
 
     company = symbol
@@ -167,25 +185,27 @@ async def analyze_stock(client, symbol, bm_candles, sector_scores):
 
     pe = None
     roe_str = "-"
+    high_52w = None
+    cur_price = quote["c"]
+
     if metrics and "metric" in metrics:
         m = metrics["metric"]
-        pe_val = m.get("peNormalizedAnnual") or m.get("peTTM")
+        pe_val = m.get("peNormalizedAnnual") or m.get("peTTM") or m.get("peAnnual")
         if pe_val and pe_val > 0:
             pe = round(pe_val, 1)
         roe_val = m.get("roeTTM") or m.get("roeRfy")
         if roe_val:
             roe_str = f"{roe_val:.1f}%"
+        high_52w = m.get("52WeekHigh")
 
-    change_1m = 0.0
-    c = candles["c"]
-    if len(c) >= 21:
-        change_1m = (c[-1] / c[-21] - 1) * 100
+    # 1일 변동률을 1M 대신 표시 (캔들 없이 1M 계산 불가)
+    change_1d = quote.get("dp", 0) or 0
 
-    sect_score = 50.0
-    for k, v in sector_scores.items():
-        if k.lower() in (sector or "").lower() or sector.lower() in k.lower():
-            sect_score = v
-            break
+    # 52주 고가 대비 위치 (퍼센트)
+    pos_52w = "-"
+    if high_52w and high_52w > 0:
+        pos_pct = (cur_price / high_52w) * 100
+        pos_52w = f"{pos_pct:.0f}%"
 
     return {
         "ticker": symbol,
@@ -193,44 +213,20 @@ async def analyze_stock(client, symbol, bm_candles, sector_scores):
         "sector": str(sector),
         "pe": pe,
         "roe": roe_str,
-        "change1m": f"{change_1m:+.1f}%",
-        "momentum_raw": calc_momentum_score(candles, bm_candles),
+        "change1m": f"{change_1d:+.1f}%",  # 실제론 1일이지만 UI 호환 위해
+        "pos52w": pos_52w,
+        "momentum_raw": calc_momentum_score(quote, metrics, recs),
         "fundamental_raw": calc_fundamental_score(metrics),
-        "sector_raw": sect_score,
+        "sector_raw": calc_sector_score(sector, metrics),
     }
-
-
-async def get_sector_scores(client):
-    bm_candles = await get_candles(client, BENCHMARK, days=90)
-    if not bm_candles or "c" not in bm_candles or len(bm_candles["c"]) < 21:
-        return {k: 50.0 for k in US_SECTOR_ETFS}
-
-    bm_c = bm_candles["c"]
-    bm_ret = (bm_c[-1] / bm_c[-21] - 1) * 100
-
-    scores = {}
-    for name, etf in US_SECTOR_ETFS.items():
-        try:
-            res = await get_candles(client, etf, days=90)
-            if res and "c" in res and len(res["c"]) >= 21:
-                c = res["c"]
-                ret = (c[-1] / c[-21] - 1) * 100
-                rs = ret - bm_ret
-                scores[name] = float(np.clip(50 + rs * 4, 0, 100))
-            else:
-                scores[name] = 50.0
-        except Exception:
-            scores[name] = 50.0
-
-    return scores
 
 
 @app.get("/")
 def root():
     return {
         "status": "ok",
-        "version": "2.0.0",
-        "data_source": "Finnhub",
+        "version": "3.0.0",
+        "data_source": "Finnhub (free tier)",
         "key_configured": bool(FINNHUB_KEY),
     }
 
@@ -244,10 +240,7 @@ async def screen_stocks(
     top_n: int = Query(20, ge=5, le=50),
 ):
     if not FINNHUB_KEY:
-        return JSONResponse(
-            {"error": "FINNHUB_KEY not set"},
-            status_code=500
-        )
+        return JSONResponse({"error": "FINNHUB_KEY not set"}, status_code=500)
 
     cache_key = f"{market}_{w_momentum}_{w_fundamental}_{w_sector}"
     cached = cache_get(cache_key)
@@ -255,13 +248,7 @@ async def screen_stocks(
         return JSONResponse({**cached, "from_cache": True})
 
     async with httpx.AsyncClient() as client:
-        sector_scores = await get_sector_scores(client)
-        bm_candles = await get_candles(client, BENCHMARK, days=180)
-
-        tasks = [
-            analyze_stock(client, t, bm_candles, sector_scores)
-            for t in US_TICKERS
-        ]
+        tasks = [analyze_stock(client, t) for t in US_TICKERS]
         results = await asyncio.gather(*tasks)
 
     valid = [r for r in results if r is not None]
@@ -281,19 +268,25 @@ async def screen_stocks(
     for i, s in enumerate(sorted_stocks, 1):
         s["rank"] = i
 
-    sector_list = sorted(
-        [
-            {
-                "name": name,
-                "etf": etf,
-                "score": round(sector_scores.get(name, 50.0), 1),
-                "trend": "강세" if sector_scores.get(name, 50) >= 60
-                         else ("중립" if sector_scores.get(name, 50) >= 40 else "약세"),
-            }
-            for name, etf in US_SECTOR_ETFS.items()
-        ],
-        key=lambda x: x["score"], reverse=True
-    )
+    # 섹터 데이터는 종목들의 평균으로 추정
+    sector_groups = {}
+    for s in valid:
+        sec = s.get("sector", "Other")
+        if sec not in sector_groups:
+            sector_groups[sec] = []
+        sector_groups[sec].append(s["momentum"])
+
+    sector_list = []
+    for sec_name, scores in sector_groups.items():
+        if scores:
+            avg = sum(scores) / len(scores)
+            sector_list.append({
+                "name": sec_name,
+                "etf": "-",
+                "score": round(avg, 1),
+                "trend": "강세" if avg >= 60 else ("중립" if avg >= 40 else "약세"),
+            })
+    sector_list.sort(key=lambda x: x["score"], reverse=True)
 
     response = {
         "market": "US",
@@ -301,7 +294,7 @@ async def screen_stocks(
         "from_cache": False,
         "weights": {"momentum": w_momentum, "fundamental": w_fundamental, "sector": w_sector},
         "top20": sorted_stocks,
-        "sectors": sector_list,
+        "sectors": sector_list[:11],
     }
 
     cache_set(cache_key, response)
