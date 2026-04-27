@@ -1,6 +1,11 @@
 """
 QUANT SCREENER - FastAPI Backend (Finnhub Free Tier)
 무료 플랜에서 사용 가능한 엔드포인트만 사용
+
+[v3.1.0 변경사항]
+- 캐시 구조 개선: 원시 점수(raw scores)만 캐싱하고 가중치 계산은 매 요청마다 수행
+- 효과: 사용자가 가중치를 바꿔도 API 재호출 없이 즉시 재계산
+- 이전 버그: 가중치 변경 시 캐시 미스 → API rate limit 초과 → 빈 결과 반환
 """
 
 from fastapi import FastAPI, Query
@@ -13,7 +18,7 @@ from datetime import datetime
 import time
 import numpy as np
 
-app = FastAPI(title="Quant Screener API", version="3.0.0")
+app = FastAPI(title="Quant Screener API", version="3.1.0")
 
 app.add_middleware(
     CORSMiddleware,
@@ -221,11 +226,30 @@ async def analyze_stock(client, symbol):
     }
 
 
+async def fetch_raw_data(market: str):
+    """
+    API에서 원시 데이터 + 원시 점수를 가져온다.
+    가중치와 무관하게 시장 단위로만 캐싱한다.
+    """
+    cache_key = f"raw_{market}"
+    cached = cache_get(cache_key)
+    if cached:
+        return cached, True  # (데이터, 캐시히트여부)
+
+    async with httpx.AsyncClient() as client:
+        tasks = [analyze_stock(client, t) for t in US_TICKERS]
+        results = await asyncio.gather(*tasks)
+
+    valid = [r for r in results if r is not None]
+    cache_set(cache_key, valid)
+    return valid, False
+
+
 @app.get("/")
 def root():
     return {
         "status": "ok",
-        "version": "3.0.0",
+        "version": "3.1.0",
         "data_source": "Finnhub (free tier)",
         "key_configured": bool(FINNHUB_KEY),
     }
@@ -242,16 +266,19 @@ async def screen_stocks(
     if not FINNHUB_KEY:
         return JSONResponse({"error": "FINNHUB_KEY not set"}, status_code=500)
 
-    cache_key = f"{market}_{w_momentum}_{w_fundamental}_{w_sector}"
-    cached = cache_get(cache_key)
-    if cached:
-        return JSONResponse({**cached, "from_cache": True})
+    # 원시 데이터는 가중치와 무관하게 캐싱 (가중치 바꿔도 API 재호출 없음)
+    raw_stocks, from_cache = await fetch_raw_data(market)
 
-    async with httpx.AsyncClient() as client:
-        tasks = [analyze_stock(client, t) for t in US_TICKERS]
-        results = await asyncio.gather(*tasks)
+    if not raw_stocks:
+        return JSONResponse({
+            "error": "No data available. API rate limit may have been exceeded.",
+            "market": market,
+            "top20": [],
+            "sectors": [],
+        }, status_code=503)
 
-    valid = [r for r in results if r is not None]
+    # 원시 데이터를 복사해서 가중치 계산 (캐시 데이터 오염 방지)
+    valid = [dict(s) for s in raw_stocks]
 
     total_w = max(w_momentum + w_fundamental + w_sector, 1)
     for s in valid:
@@ -291,12 +318,10 @@ async def screen_stocks(
     response = {
         "market": "US",
         "updated": datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
-        "from_cache": False,
+        "from_cache": from_cache,
         "weights": {"momentum": w_momentum, "fundamental": w_fundamental, "sector": w_sector},
         "top20": sorted_stocks,
         "sectors": sector_list[:11],
     }
 
-    cache_set(cache_key, response)
     return JSONResponse(response)
-
